@@ -7,6 +7,7 @@
 #include <sys/eventfd.h>
 #endif
 #include <cinttypes>
+#include <mutex>
 
 #include "FPPSMPTE.h"
 #include "Plugin.h"
@@ -244,10 +245,14 @@ public:
     }
     
     
-    uint64_t lastMS = 0;
+    // UINT64_MAX sentinel ensures the very first decoded frame is always processed,
+    // even when TC starts at 00:00:00:00 (which would produce df==0 against a 0 initial value).
+    uint64_t lastMS = UINT64_MAX;
     static void InputAudioCallback(FPPSMPTEPlugin *p, Uint8* stream, int len) {
         ltc_decoder_write_u16(p->ltcDecoder, (uint16_t*)stream, len / 2, p->decoderPos);
-        p->decoderPos += len;
+        // Fix: decoderPos tracks sample position, not byte position.
+        // len is bytes; each S16 sample is 2 bytes, so sample count is len/2.
+        p->decoderPos += len / 2;
         LTCFrameExt frame;
         while (ltc_decoder_read(p->ltcDecoder, &frame)) {
             SMPTETimecode stime;
@@ -256,20 +261,24 @@ public:
             float f = stime.frame;
             f /= p->framerate;
             f *= 1000;
-            uint64_t oms = f;
+            uint64_t oms = (uint64_t)f;
             msTimeStamp += oms;
 
-            uint64_t df = msTimeStamp > p->lastMS ? (msTimeStamp - p->lastMS) : (p->lastMS - msTimeStamp);
-            if (df > 0 && df < 5000 && p->inputEventFileWrite >= 0) {                
-                //printf("msTimeStamp: %d     frame: %d\n", (int)msTimeStamp, (int)stime.frame);
+            // Fix: the old check `df > 0 && df < 5000` silently dropped any timecode jump
+            // larger than 5 seconds (seeks, restarts, large scrubs) AND prevented the
+            // stop-at-00:00:00:00 (idx=-99) signal from ever being sent after such a jump.
+            // Now we process every frame where TC changed, regardless of jump size.
+            if (msTimeStamp != p->lastMS && p->inputEventFileWrite >= 0) {
+                //LogDebug(VB_PLUGIN, "SMPTE RX: h:%d m:%d s:%d f:%d -> %lums\n",
+                //         stime.hours, stime.mins, stime.secs, stime.frame, (unsigned long)msTimeStamp);
                 int32_t idx = 0;
                 if (p->timeCodePType == TimeCodeProcessingType::HOUR) {
-                    constexpr int DIV = 1000 * 60 * 60;
-                    idx = msTimeStamp / DIV;
+                    constexpr uint64_t DIV = 1000ULL * 60 * 60;
+                    idx = (int32_t)(msTimeStamp / DIV);
                     msTimeStamp %= DIV;
                 } else if (p->timeCodePType == TimeCodeProcessingType::MIN15) {
-                    constexpr int DIV = 1000 * 60 * 15;
-                    idx = msTimeStamp / DIV;
+                    constexpr uint64_t DIV = 1000ULL * 60 * 15;
+                    idx = (int32_t)(msTimeStamp / DIV);
                     msTimeStamp %= DIV;
                 } else if (p->timeCodePType == TimeCodeProcessingType::PLAYLIST_ITEM_DEFINED) {
                     idx = -2;
@@ -279,11 +288,19 @@ public:
                 if (oms == 0 && stime.hours == 0 && stime.mins == 0 && stime.secs == 0) {
                     idx = -99;
                 }
-                p->currentPosMS = msTimeStamp;
-                p->currentUserBits =  getUserBits(&frame.ltc);
-                p->currentIdx = idx;
-                //printf("Frame: h: %d     m: %d    s:   %d    f: %d       ts: %d\n", stime.hours, stime.mins, stime.secs, stime.frame, (int)msTimeStamp);
-                write(p->inputEventFileWrite, &msTimeStamp, sizeof(msTimeStamp));
+                // Fix: protect the triplet with a mutex so the main thread always reads
+                // a consistent (posMS, userBits, idx) set from the same decoded frame.
+                {
+                    std::lock_guard<std::mutex> lock(p->frameMutex);
+                    p->currentPosMS = msTimeStamp;
+                    p->currentUserBits = getUserBits(&frame.ltc);
+                    p->currentIdx = idx;
+                }
+                // Fix: always write a non-zero constant signal value.
+                // On Linux, eventfd treats the written uint64_t as a value to ADD to its
+                // internal counter; writing 0 returns EINVAL, silently dropping the event.
+                const uint64_t signal = 1;
+                write(p->inputEventFileWrite, &signal, sizeof(signal));
             }
             p->lastMS = msTimeStamp;
         }
@@ -309,7 +326,8 @@ public:
         want.userdata = this;
         audioDev = SDL_OpenAudioDevice(dev.c_str(), 1, &want, &obtained, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
         if (audioDev < 2) {
-            LogInfo(VB_PLUGIN, "SMPTE - Could not open Input Audio Device: %c\n", dev.c_str());
+            // Fix: format specifier was %c (single char), should be %s (string)
+            LogInfo(VB_PLUGIN, "SMPTE - Could not open Input Audio Device: %s\n", dev.c_str());
             return false;
         }
         SDL_ClearError();
@@ -345,18 +363,38 @@ public:
                     pipe(files);
                     inputEventFileRead = files[0];
                     inputEventFileWrite = files[1];
-                    fcntl(inputEventFileRead, F_SETFD, O_NONBLOCK);
-                    fcntl(inputEventFileWrite, F_SETFD, O_NONBLOCK);
+                    // Fix: F_SETFD sets file-descriptor flags (close-on-exec), not file-status
+                    // flags. O_NONBLOCK is a file-status flag and must be set with F_SETFL.
+                    // Without this fix the pipe is blocking, and the drain loop below hangs
+                    // the main FPP thread when the pipe runs dry.
+                    fcntl(inputEventFileRead,  F_SETFL, O_NONBLOCK);
+                    fcntl(inputEventFileWrite, F_SETFL, O_NONBLOCK);
 #endif
                     callbacks[inputEventFileRead] = [this](int i) {
+                        // Drain all pending signals. The actual sync data comes from the
+                        // mutex-protected triplet (currentPosMS / currentIdx / currentUserBits)
+                        // so we only need the most recent snapshot after the drain.
                         uint64_t ts;
                         ssize_t s = read(i, &ts, sizeof(ts));
                         while (s > 0) {
                             s = read(i, &ts, sizeof(ts));
                         }
-                        
+
+                        // Fix: read the triplet under the mutex to get a consistent snapshot
+                        // from a single decoded LTC frame. Previously, three separate atomic
+                        // reads could see values from different frames (torn read).
+                        uint64_t ms;
+                        int32_t  idx;
+                        uint32_t userBits;
+                        {
+                            std::lock_guard<std::mutex> lock(frameMutex);
+                            ms       = currentPosMS;
+                            idx      = currentIdx;
+                            userBits = currentUserBits;
+                        }
+
                         std::string pl = "";
-                        std::string f = "smpte-pl-" + std::to_string(currentUserBits);
+                        std::string f = "smpte-pl-" + std::to_string(userBits);
                         if (FileExists(FPP_DIR_PLAYLIST(f + ".json"))) {
                             pl = f;
                         }
@@ -367,8 +405,6 @@ public:
                             pl = "";
                         }
                         if (pl != "") {
-                            uint64_t ms = currentPosMS;
-                            int32_t idx = currentIdx;
                             if (idx == -99) {
                                 MultiSync::INSTANCE.SyncStopAll();
                             } else {
@@ -410,9 +446,13 @@ public:
     ltc_off_t  decoderPos = 0;
     int        inputEventFileRead = -1;
     int        inputEventFileWrite = -1;
-    std::atomic<uint64_t> currentPosMS = 0;
-    std::atomic<uint32_t> currentUserBits = 0;
-    std::atomic<int32_t>  currentIdx = 0;
+    // Guarded by frameMutex; written by the SDL audio callback, read by the main thread.
+    // Using plain types + mutex instead of separate atomics so the triplet is always
+    // read/written as a consistent unit from a single decoded frame.
+    std::mutex   frameMutex;
+    uint64_t     currentPosMS   = 0;
+    uint32_t     currentUserBits = 0;
+    int32_t      currentIdx     = 0;
     bool       actAsMaster = false;
     
 

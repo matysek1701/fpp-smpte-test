@@ -1,7 +1,7 @@
 {
 	"repoName": "fpp-smpte",
 	"name": "SMPTE Test",
-	"author": "Daniel Kulp",
+	"author": "Daniel Kulp ++",
 	"description": "Listener/Generator for SMPTE Linear Time Codes TEST",
 	"homeURL": "https://github.com/matysek1701/fpp-smpte",
 	"srcURL": "https://github.com/matysek1701/fpp-smpte.git",
